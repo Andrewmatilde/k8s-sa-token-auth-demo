@@ -1,0 +1,4 @@
+*
+!bin/
+!bin/linux-amd64/
+!bin/linux-amd64/*

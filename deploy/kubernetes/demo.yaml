@@ -1,0 +1,216 @@
+# Internal API ServiceAccount token auth demo.
+# Prerequisites (see README "真实 Kubernetes 部署"):
+#   kubectl -n internal-api create secret tls internal-api-tls --cert=certs/tls.crt --key=certs/tls.key
+#   kubectl -n production create configmap internal-api-ca --from-file=ca.crt=certs/ca.crt
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: internal-api
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+---
+# Server identity: used ONLY to call TokenReview.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: internal-api
+  namespace: internal-api
+---
+# Client identities. Their default (kube-apiserver audience) tokens are not
+# mounted; pods get only an internal-api audience token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker
+  namespace: production
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller
+  namespace: production
+automountServiceAccountToken: false
+---
+# Least privilege: create TokenReviews and nothing else (not system:auth-delegator,
+# which also grants subjectaccessreviews; never cluster-admin).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: internal-api-tokenreview
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: internal-api-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: internal-api-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: internal-api
+    namespace: internal-api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: internal-api
+  namespace: internal-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: internal-api}
+  template:
+    metadata:
+      labels: {app: internal-api}
+    spec:
+      serviceAccountName: internal-api
+      # The server needs its own (kube-apiserver audience) token to call TokenReview.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: server
+          image: uhub.service.ucloud.cn/andrew/sa-token-auth-demo:v0.1.0
+          imagePullPolicy: Always
+          command: ["/server"]
+          args:
+            - -addr=:8443
+            - -tls-cert=/etc/internal-api/tls/tls.crt
+            - -tls-key=/etc/internal-api/tls/tls.key
+            - -audience=internal-api
+            # Trusted cluster identity comes from server config, not requests.
+            - -cluster=uk8s-xxxxxxxx  # replace with your cluster ID
+            - -cache-ttl=30s
+            - -review-timeout=3s
+          ports:
+            - {name: https, containerPort: 8443}
+          readinessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+          livenessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: tls, mountPath: /etc/internal-api/tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret:
+            secretName: internal-api-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: internal-api
+  namespace: internal-api
+spec:
+  selector: {app: internal-api}
+  ports:
+    - {name: https, port: 8443, targetPort: https}
+---
+# worker: GET allowed, POST denied.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker-client
+  namespace: production
+spec:
+  serviceAccountName: worker
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    # 1.17/1.18 kubelet writes the projected token as 0600 root; fsGroup makes
+    # it group-readable by this GID so a non-root container can read it.
+    fsGroup: 65532
+  containers:
+    - name: client
+      image: uhub.service.ucloud.cn/andrew/sa-token-auth-demo:v0.1.0
+      imagePullPolicy: Always
+      command: ["/client"]
+      args:
+        - -demo
+        - -url=https://internal-api.internal-api.svc:8443
+        - -token-file=/var/run/secrets/internal-api/token
+        - -ca-file=/etc/internal-api/ca/ca.crt
+        - -interval=15s
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: ["ALL"]}
+      volumeMounts:
+        - {name: internal-token, mountPath: /var/run/secrets/internal-api, readOnly: true}
+        - {name: internal-api-ca, mountPath: /etc/internal-api/ca, readOnly: true}
+  volumes:
+    - name: internal-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: internal-api
+              expirationSeconds: 3600
+    - name: internal-api-ca
+      configMap:
+        name: internal-api-ca
+---
+# controller: GET and POST allowed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: controller-client
+  namespace: production
+spec:
+  serviceAccountName: controller
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    # 1.17/1.18 kubelet writes the projected token as 0600 root; fsGroup makes
+    # it group-readable by this GID so a non-root container can read it.
+    fsGroup: 65532
+  containers:
+    - name: client
+      image: uhub.service.ucloud.cn/andrew/sa-token-auth-demo:v0.1.0
+      imagePullPolicy: Always
+      command: ["/client"]
+      args:
+        - -demo
+        - -url=https://internal-api.internal-api.svc:8443
+        - -token-file=/var/run/secrets/internal-api/token
+        - -ca-file=/etc/internal-api/ca/ca.crt
+        - -interval=15s
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: ["ALL"]}
+      volumeMounts:
+        - {name: internal-token, mountPath: /var/run/secrets/internal-api, readOnly: true}
+        - {name: internal-api-ca, mountPath: /etc/internal-api/ca, readOnly: true}
+  volumes:
+    - name: internal-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: internal-api
+              expirationSeconds: 3600
+    - name: internal-api-ca
+      configMap:
+        name: internal-api-ca
