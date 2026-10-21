@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内部 API ServiceAccount Token 认证 · 1.18 集群实测说明</title>
+<style>
+  :root {
+    --ink: #1d2433; --muted: #5b6475; --line: #d9dee7; --bg: #f6f7f9; --card: #fff;
+    --blue: #2f6fd6; --blue-bg: #eaf1fc; --green: #1f8a4c; --green-bg: #e7f5ec;
+    --red: #c43d3d; --red-bg: #fbeaea; --amber: #a86a00; --amber-bg: #fdf3e1;
+    --violet: #6b4fc8; --violet-bg: #f0ecfb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); }
+  main { max-width: 1080px; margin: 0 auto; padding: 40px 24px 80px; }
+  header h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: .2px; }
+  header p { margin: 0; color: var(--muted); }
+  nav { margin: 22px 0 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+  nav a { font-size: 13px; color: var(--blue); text-decoration: none; background: var(--blue-bg); padding: 3px 10px; border-radius: 999px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 24px 28px; margin-top: 22px; }
+  h2 { font-size: 20px; margin: 0 0 14px; }
+  h3 { font-size: 16px; margin: 22px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; background: #fafbfc; }
+  code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #f1f3f6; padding: 1px 5px; border-radius: 4px; }
+  pre { font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #0f1724; color: #dbe4f3; padding: 14px 16px; border-radius: 8px; overflow-x: auto; }
+  .tldr { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .tile { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: #fcfcfd; }
+  .tile b { display: block; font-size: 13px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+  .tile span { font-size: 15px; }
+  .pill { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; }
+  .ok { color: var(--green); background: var(--green-bg); }
+  .no { color: var(--red); background: var(--red-bg); }
+  .warn { color: var(--amber); background: var(--amber-bg); }
+  .info { color: var(--blue); background: var(--blue-bg); }
+  .note { border-left: 4px solid var(--amber); background: var(--amber-bg); padding: 10px 14px; border-radius: 6px; margin: 14px 0; }
+  .note.blue { border-color: var(--blue); background: var(--blue-bg); }
+  .diagram { width: 100%; overflow-x: auto; }
+  .diagram svg { min-width: 900px; width: 100%; height: auto; display: block; }
+  .steps { counter-reset: s; list-style: none; padding: 0; margin: 0; }
+  .steps li { counter-increment: s; position: relative; padding: 8px 0 8px 40px; border-bottom: 1px dashed var(--line); }
+  .steps li::before { content: counter(s); position: absolute; left: 0; top: 8px; width: 26px; height: 26px; border-radius: 50%; background: var(--blue); color: #fff; font-size: 13px; font-weight: 700; display: grid; place-items: center; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } section { padding: 18px; } }
+  ul { padding-left: 20px; margin: 6px 0; }
+  footer { color: var(--muted); font-size: 13px; margin-top: 28px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>内部 API 认证：Kubernetes ServiceAccount Token + TokenReview</h1>
+  <p>UK8s 1.18.19 测试集群实测说明 · 2026-10-21 · 代码：<a href="https://github.com/Andrewmatilde/k8s-sa-token-auth-demo">github.com/Andrewmatilde/k8s-sa-token-auth-demo</a></p>
+</header>
+
+<nav>
+  <a href="#tldr">一句话结论</a><a href="#terms">术语</a><a href="#cluster">集群现状</a><a href="#topo">部署拓扑</a>
+  <a href="#flow">安全链路</a><a href="#codes">判定规则</a><a href="#verify">验证结果</a>
+  <a href="#model">安全边界</a><a href="#risk">风险与后续</a>
+</nav>
+
+<section id="tldr">
+  <h2>一句话结论</h2>
+  <p>Pod 用 kubelet 签发的、<b>audience 绑定为 <code>internal-api</code></b> 的短期 ServiceAccount Token 调用内部 HTTPS API。服务端调用 kube-apiserver 的 <b>TokenReview</b> 验证 token，验证成功的结果在本地<b>缓存 30 秒</b>，然后按 <b>Namespace + ServiceAccount</b> 做默认拒绝的授权。方案不引入 Service Mesh，也不需要独立的 STS 或 JWT Issuer。</p>
+  <div class="tldr">
+    <div class="tile"><b>状态</b><span class="pill ok">1.18.19 集群端到端已跑通</span></div>
+    <div class="tile"><b>集群前置改动</b><span>kube-apiserver 增加 3 个参数，开启 TokenRequest</span></div>
+    <div class="tile"><b>热路径开销（缓存命中）</b><span>约 149 ns/op，0 次内存分配，不访问 API Server</span></div>
+    <div class="tile"><b>失败策略</b><span>API Server 故障或超时 → 503，<b>一律拒绝</b>，不缓存</span></div>
+  </div>
+</section>
+
+<section id="terms">
+  <h2>术语</h2>
+  <table>
+    <tr><th style="width:220px">术语</th><th>含义</th></tr>
+    <tr><td><b>audience（aud）</b></td><td>JWT 中的 <code>aud</code> 字段，表示<b>这张 token 是签发给谁用的</b>，也就是哪个服务应该接收它。接收方只接受 aud 是自己的 token。类比：门禁卡上写着「仅限 3 楼」，拿到 5 楼刷不开。这里业务 token 的 aud 是 <code>internal-api</code>，kube-apiserver 自己只认 <code>https://kubernetes.default.svc</code>，所以两种 token 不能互用，一张泄露也打不开另一个。</td></tr>
+    <tr><td><b>Projected SA Token</b></td><td>kubelet 通过 TokenRequest API 为 Pod 申请的 token：可以<b>指定 audience</b>、<b>有效期短</b>（这里是 1 小时，自动轮换），并且<b>绑定 Pod</b>，Pod 删除后立即失效。挂载方式是 <code>projected</code> 卷中的 <code>serviceAccountToken</code> 源。</td></tr>
+    <tr><td><b>legacy SA Token</b></td><td>旧式 token，保存在 SA 的 Secret 里：<b>没有 audience、永不过期</b>，只要 Secret 还在就一直有效。本方案不接受它。</td></tr>
+    <tr><td><b>TokenRequest</b></td><td>kube-apiserver 签发 projected token 的 API。需要 apiserver 配置 issuer 和 signing key 才会开启；UK8s 1.18 默认没有开启。</td></tr>
+    <tr><td><b>TokenReview</b></td><td>kube-apiserver 提供的「帮我验一下这张 token」API。服务端提交 token 和期望的 audience，apiserver 返回是否有效以及身份（namespace/SA/UID）。验签、过期判断、Pod 是否还存在都由 apiserver 完成。</td></tr>
+    <tr><td><b>singleflight</b></td><td>同一个 key 的并发请求只真正执行一次，其余请求等待并共享结果。这里用来保证同一个 token 的并发缓存未命中只触发一次 TokenReview。</td></tr>
+  </table>
+</section>
+
+<section id="cluster">
+  <h2>集群现状</h2>
+  <table>
+    <tr><th style="width:200px">项目</th><th>值</th></tr>
+    <tr><td>集群</td><td>UK8s 1.18.19 测试集群（集群 ID 已隐去）</td></tr>
+    <tr><td>版本 / 运行时</td><td>Kubernetes v1.18.19 · Docker 20.10.11 · CNI 1.0.4-lts</td></tr>
+    <tr><td>节点</td><td>3 master（SchedulingDisabled）+ 2 worker，全部 Ready</td></tr>
+        <tr><td>Demo 镜像</td><td><code>uhub.service.ucloud.cn/andrew/sa-token-auth-demo:v0.1.0</code>（scratch 基础镜像，含 server 和 client）</td></tr>
+  </table>
+
+  <h3>对控制面做的改动（UK8s 1.18 默认未开启 TokenRequest）</h3>
+  <p>改动前，客户端 Pod 卡在 <code>failed to fetch token: the API server does not have TokenRequest endpoints enabled</code>；同时，带 audiences 的 TokenReview 会返回 500 <code>error validating audiences</code>。处理方式是在 3 台 master 的 <code>/etc/kubernetes/apiserver</code> 中<b>逐台滚动</b>追加以下参数，每台重启后 2–3 秒 healthz 恢复正常：</p>
+<pre>--service-account-issuer=https://kubernetes.default.svc
+--service-account-signing-key-file=/etc/kubernetes/ssl/ca-key.pem
+--api-audiences=https://kubernetes.default.svc</pre>
+  <ul>
+    <li>签名私钥沿用 controller-manager 原本签发 legacy token 的 <code>ca-key.pem</code>，与已有的 <code>--service-account-key-file=ca.pem</code> 是同一对密钥，<b>存量 token 不受影响</b>。</li>
+    <li><code>internal-api</code> <b>故意没有</b>加入 <code>--api-audiences</code>，这样内部 API 的 token 无法被 kube-apiserver 接受。</li>
+    <li>每台都有备份：<code>/etc/kubernetes/apiserver.bak-20261021-tokenrequest</code>，可以随时还原。</li>
+  </ul>
+
+  <h3>已部署的资源</h3>
+  <table>
+    <tr><th style="width:200px">Namespace</th><th>资源</th></tr>
+    <tr><td><code>internal-api</code></td><td>SA <code>internal-api</code> · Deployment <code>internal-api</code>（1 副本）· Service <code>internal-api:8443</code> · Secret <code>internal-api-tls</code></td></tr>
+    <tr><td><code>production</code></td><td>SA <code>worker</code> / <code>controller</code>（<code>automountServiceAccountToken: false</code>）· Pod <code>worker-client</code> / <code>controller-client</code>（每 15s 调用一轮）· ConfigMap <code>internal-api-ca</code></td></tr>
+    <tr><td>集群级</td><td>ClusterRole + ClusterRoleBinding <code>internal-api-tokenreview</code>：<b>只有</b> <code>create tokenreviews</code></td></tr>
+  </table>
+</section>
+
+<section id="topo">
+  <h2>部署拓扑</h2>
+  <div class="diagram">
+  <svg viewBox="0 0 1000 580" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, PingFang SC, Microsoft YaHei, sans-serif" font-size="13">
+    <defs>
+      <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fd6"/></marker>
+      <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6b4fc8"/></marker>
+      <marker id="k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f8a4c"/></marker>
+    </defs>
+    <rect x="10" y="30" width="980" height="545" rx="14" fill="#fafbfc" stroke="#c5ccd8"/>
+    <text x="30" y="56" font-size="15" font-weight="700" fill="#1d2433">UK8s 测试集群 · v1.18.19</text>
+
+    <!-- control plane -->
+    <rect x="30" y="76" width="290" height="474" rx="10" fill="#f0ecfb" stroke="#b9a9ea"/>
+    <text x="46" y="100" font-weight="700" fill="#6b4fc8">控制面 · 3 master</text>
+    <g>
+      <rect x="50" y="116" width="250" height="64" rx="8" fill="#fff" stroke="#b9a9ea"/>
+      <text x="64" y="140" font-weight="600">kube-apiserver</text><text x="64" y="162" fill="#5b6475">master-1</text>
+      <rect x="50" y="192" width="250" height="64" rx="8" fill="#fff" stroke="#b9a9ea"/>
+      <text x="64" y="216" font-weight="600">kube-apiserver</text><text x="64" y="238" fill="#5b6475">master-2</text>
+      <rect x="50" y="268" width="250" height="64" rx="8" fill="#fff" stroke="#b9a9ea"/>
+      <text x="64" y="292" font-weight="600">kube-apiserver</text><text x="64" y="314" fill="#5b6475">master-3</text>
+    </g>
+    <rect x="50" y="346" width="250" height="118" rx="8" fill="#fff" stroke="#d9dee7" stroke-dasharray="4 3"/>
+    <text x="62" y="368" font-weight="600" fill="#6b4fc8">新增参数</text>
+    <text x="62" y="390" font-size="12" fill="#1d2433">issuer = kubernetes.default.svc</text>
+    <text x="62" y="410" font-size="12" fill="#1d2433">signing-key = ca-key.pem（原密钥）</text>
+    <text x="62" y="430" font-size="12" fill="#1d2433">api-audiences = 同 issuer</text>
+    <text x="62" y="450" font-size="12" fill="#c43d3d">internal-api 不在 api-audiences 中</text>
+    <text x="50" y="494" font-size="12" fill="#5b6475">签发 token；TokenReview 校验签名、</text>
+    <text x="50" y="512" font-size="12" fill="#5b6475">过期、绑定的 Pod/SA、audience</text>
+
+    <!-- workers -->
+    <rect x="360" y="76" width="610" height="474" rx="10" fill="#f4f8fe" stroke="#a9c3ee"/>
+    <text x="376" y="100" font-weight="700" fill="#2f6fd6">Worker 节点 · worker-1 / worker-2</text>
+
+    <!-- ns production -->
+    <rect x="380" y="116" width="260" height="262" rx="10" fill="#fff" stroke="#a9c3ee"/>
+    <text x="394" y="138" font-weight="700">ns: production</text>
+    <rect x="396" y="150" width="228" height="100" rx="8" fill="#eaf1fc" stroke="#a9c3ee"/>
+    <text x="408" y="172" font-weight="600">Pod worker-client</text>
+    <text x="408" y="192" font-size="12" fill="#5b6475">SA production/worker</text>
+    <text x="408" y="210" font-size="12" fill="#5b6475">token: aud=internal-api · 3600s</text>
+    <text x="408" y="228" font-size="12" fill="#5b6475">uid/fsGroup 65532 · 无默认 token</text>
+    <rect x="396" y="262" width="228" height="100" rx="8" fill="#eaf1fc" stroke="#a9c3ee"/>
+    <text x="408" y="284" font-weight="600">Pod controller-client</text>
+    <text x="408" y="304" font-size="12" fill="#5b6475">SA production/controller</text>
+    <text x="408" y="322" font-size="12" fill="#5b6475">token: aud=internal-api · 3600s</text>
+    <text x="408" y="340" font-size="12" fill="#5b6475">挂载 CA，校验服务端证书</text>
+
+    <!-- ns internal-api -->
+    <rect x="700" y="116" width="250" height="262" rx="10" fill="#fff" stroke="#a9c3ee"/>
+    <text x="714" y="138" font-weight="700">ns: internal-api</text>
+    <rect x="716" y="150" width="218" height="56" rx="8" fill="#eaf1fc" stroke="#a9c3ee"/>
+    <text x="728" y="173" font-weight="600">Service internal-api:8443</text>
+    <text x="728" y="193" font-size="12" fill="#5b6475">HTTPS（单向 TLS）</text>
+    <rect x="716" y="226" width="218" height="136" rx="8" fill="#e7f5ec" stroke="#94cfa9"/>
+    <text x="728" y="248" font-weight="600">Deployment internal-api</text>
+    <text x="728" y="268" font-size="12" fill="#5b6475">Middleware：缓存 → TokenReview</text>
+    <text x="728" y="286" font-size="12" fill="#5b6475">Authorizer：ns/sa/method/path</text>
+    <text x="728" y="304" font-size="12" fill="#5b6475">本地缓存 TTL 30s · singleflight</text>
+    <text x="728" y="322" font-size="12" fill="#5b6475">SA 仅 create tokenreviews</text>
+    <text x="728" y="340" font-size="12" fill="#5b6475">TLS Secret · cluster 来自配置</text>
+
+    <!-- kubelet -->
+    <rect x="380" y="414" width="260" height="70" rx="8" fill="#fff" stroke="#94cfa9"/>
+    <text x="394" y="438" font-weight="600">kubelet（每个节点）</text>
+    <text x="394" y="458" font-size="12" fill="#5b6475">申请并轮换 token（到 80% 寿命时刷新）</text>
+    <text x="394" y="475" font-size="12" fill="#5b6475">原子替换 ..data 符号链接</text>
+
+    <!-- arrows -->
+    <path d="M640 230 C 670 230, 680 178, 714 178" fill="none" stroke="#2f6fd6" stroke-width="2.2" marker-end="url(#a)"/>
+    <text x="646" y="214" font-size="12" font-weight="700" fill="#2f6fd6">①</text>
+    <path d="M825 206 V224" stroke="#2f6fd6" stroke-width="2" marker-end="url(#a)"/>
+    <path d="M825 362 V560 H175 V552" fill="none" stroke="#6b4fc8" stroke-width="2.2" marker-end="url(#g)"/>
+    <text x="400" y="540" font-size="12" font-weight="700" fill="#6b4fc8">② TokenReview(aud=internal-api) · 使用服务端 SA 自己的 token · 3s 超时</text>
+    <path d="M380 449 H 324" stroke="#1f8a4c" stroke-width="2.2" marker-end="url(#k)"/>
+    <text x="344" y="440" font-size="12" font-weight="700" fill="#1f8a4c">⓪</text>
+    <path d="M510 414 V366" stroke="#1f8a4c" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#k)"/>
+    <text x="518" y="398" font-size="12" fill="#1f8a4c">写入 token 文件</text>
+
+    <!-- legend -->
+    <g font-size="12">
+      <text x="660" y="420" font-weight="700" fill="#1f8a4c">⓪ 签发：kubelet → TokenRequest</text>
+      <text x="660" y="442" font-weight="700" fill="#2f6fd6">① 调用：HTTPS + Bearer &lt;JWT&gt;</text>
+      <text x="660" y="464" font-weight="700" fill="#6b4fc8">② 验证：仅在缓存未命中时发生</text>
+    </g>
+  </svg>
+  </div>
+</section>
+
+<section id="flow">
+  <h2>安全链路：一次请求的完整流程</h2>
+  <div class="diagram"><svg id="seq" xmlns="http://www.w3.org/2000/svg"></svg></div>
+
+  <h3>逐步说明</h3>
+  <ol class="steps">
+    <li><b>签发。</b>kubelet 代表 Pod 调用 TokenRequest，申请 audience=<code>internal-api</code>、有效期 1 小时的 token。apiserver 用 <code>ca-key.pem</code> 签名，token 中绑定了 Pod 和 SA。</li>
+    <li><b>落盘。</b>kubelet 通过原子替换符号链接把 token 写入 <code>/var/run/secrets/internal-api/token</code>，并通过 <code>fsGroup</code> 让非 root 进程可读。Pod <b>不挂载</b> kube-apiserver audience 的默认 token。</li>
+    <li><b>取用。</b>Client <b>每次请求都重新读取</b> token 文件，不在内存中长期保存，所以 kubelet 轮换后立即生效。</li>
+    <li><b>发送。</b>只走 HTTPS，并用指定的 CA 校验服务端证书（不提供跳过校验的选项）。token 只发往白名单中的 host，跨 host 的重定向不跟随。</li>
+    <li><b>解析。</b>Middleware 只接受<b>一个</b> <code>Authorization: Bearer &lt;JWT 字符集&gt;</code> 头，且长度不超过 16 KiB，否则返回 401。客户端传入的 <code>X-Namespace</code> 之类的头一律忽略。</li>
+    <li><b>查缓存。</b>Key = <code>SHA-256(token) + audience + cluster</code>，缓存中不保存 token 明文。命中且未过期时直接得到 Identity，<b>不访问 API Server</b>。</li>
+    <li><b>未命中。</b>同一个 token 的并发请求由 singleflight 合并为一次 TokenReview。<code>spec.audiences</code> 固定取服务端配置，客户端无法指定。请求带独立的 3s 超时，不会因为某个调用方断开而取消。</li>
+    <li><b>校验结果。</b>要求 <code>status.error</code> 为空、<code>authenticated=true</code>、<code>status.audiences</code> 包含 <code>internal-api</code>，并且 username 严格符合 <code>system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code>。</li>
+    <li><b>写缓存。</b><b>只缓存成功结果</b>，TTL 为 30s，<b>从发起 review 之前开始计时</b>，所以慢请求不会延长有效期。singleflight 返回后还会再检查一次是否已过期。</li>
+    <li><b>构造身份。</b>Identity 中的 <code>Cluster</code> 来自服务端启动参数 <code>-cluster</code>，其余字段来自 TokenReview，然后放入 request context。</li>
+    <li><b>授权。</b>Authorizer 每次实时按 (ns, sa, method, path) 精确匹配允许列表，<b>默认拒绝</b>，不匹配返回 403。授权结果不缓存，与认证缓存完全分离。</li>
+  </ol>
+</section>
+
+<section id="codes">
+  <h2>判定规则</h2>
+  <div class="two">
+    <table>
+      <tr><th>情况</th><th>返回</th></tr>
+      <tr><td>无 token / 格式错误 / 多个 Authorization 头</td><td><span class="pill no">401</span></td></tr>
+      <tr><td>token 无效、已过期、绑定的 Pod/SA 已删除</td><td><span class="pill no">401</span></td></tr>
+      <tr><td>audience 不是 internal-api（含 kube-apiserver token、legacy token）</td><td><span class="pill no">401</span></td></tr>
+      <tr><td>非 ServiceAccount 身份（如普通用户证书或 token）</td><td><span class="pill no">401</span></td></tr>
+      <tr><td>TokenReview 超时、API Server 不可用或返回 5xx</td><td><span class="pill warn">503</span> 一律拒绝，不缓存</td></tr>
+      <tr><td>认证通过，但策略不允许</td><td><span class="pill no">403</span></td></tr>
+      <tr><td><code>/healthz</code></td><td><span class="pill info">无需认证</span></td></tr>
+    </table>
+    <table>
+      <tr><th>身份</th><th>GET /api/jobs</th><th>POST /api/jobs</th></tr>
+      <tr><td>production / worker</td><td><span class="pill ok">ALLOW</span></td><td><span class="pill no">DENY</span></td></tr>
+      <tr><td>production / controller</td><td><span class="pill ok">ALLOW</span></td><td><span class="pill ok">ALLOW</span></td></tr>
+      <tr><td>其他任何身份</td><td><span class="pill no">DENY</span></td><td><span class="pill no">DENY</span></td></tr>
+      <tr><td colspan="3" style="color:var(--muted)"><code>/api/whoami</code> 只要求认证，返回 Identity（不含 token）</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="verify">
+  <h2>验证结果</h2>
+  <h3>真实集群端到端（1.18.19）</h3>
+  <table>
+    <tr><th>调用方</th><th>GET /api/whoami</th><th>GET /api/jobs</th><th>POST /api/jobs</th></tr>
+    <tr><td>worker-client</td><td><span class="pill ok">200</span> ns=production, sa=worker</td><td><span class="pill ok">200</span></td><td><span class="pill no">403</span></td></tr>
+    <tr><td>controller-client</td><td><span class="pill ok">200</span> ns=production, sa=controller</td><td><span class="pill ok">200</span></td><td><span class="pill ok">201</span></td></tr>
+  </table>
+
+  <h3>audience 隔离（同一个 SA 的三种 token 交叉测试）</h3>
+  <table>
+    <tr><th>token</th><th>发给 kube-apiserver</th><th>发给 internal-api</th></tr>
+    <tr><td>projected，aud=internal-api（业务使用的 token）</td><td><span class="pill no">401</span> 被拒绝</td><td><span class="pill ok">200</span></td></tr>
+    <tr><td>projected，aud=kubernetes.default.svc</td><td><span class="pill info">403</span> 认证通过，但无 RBAC 权限</td><td><span class="pill no">401</span></td></tr>
+    <tr><td>legacy Secret token（永久有效）</td><td><span class="pill info">403</span> 认证通过，但无 RBAC 权限</td><td><span class="pill no">401</span></td></tr>
+  </table>
+  <p style="color:var(--muted);font-size:13px">结论：业务 token 泄露后无法用来访问 kube-apiserver；集群 token 也无法用来调用内部 API。</p>
+
+  <h3>其他检查</h3>
+  <ul>
+    <li>服务端 SA 权限：<code>create tokenreviews</code> = yes；<code>subjectaccessreviews</code> 和 <code>list secrets</code> = no。</li>
+    <li>服务端日志中 JWT 出现次数：<b>0</b>。日志只记录 ns/sa/路径和拒绝原因。</li>
+    <li>单元测试 19 个全部通过（含 <code>-race</code>），覆盖缓存命中/过期、100 并发只触发 1 次 TokenReview、超时和 API Server 不可用时一律拒绝、token 轮换、不同 token 不共享缓存、日志不含 token 等场景；对 client-go v0.18 的 TokenReview 调用也有测试。</li>
+  </ul>
+  <h3>Benchmark（Apple M4，实测；不同机器结果会不同）</h3>
+  <table>
+    <tr><th>场景</th><th>耗时</th><th>内存分配</th><th>TokenReview 次数</th></tr>
+    <tr><td>缓存命中</td><td>148.9 ns/op</td><td>0 B/op · 0 allocs</td><td>0</td></tr>
+    <tr><td>缓存未命中（fake reviewer，不含网络）</td><td>3231 ns/op</td><td>1617 B/op · 13 allocs</td><td>每次 1</td></tr>
+    <tr><td>多核并发、同一个 token</td><td>142.4 ns/op</td><td>0 B/op · 0 allocs</td><td>整个 benchmark 共 1 次</td></tr>
+  </table>
+</section>
+
+<section id="model">
+  <h2>安全边界</h2>
+  <div class="two">
+    <div>
+      <h3 style="margin-top:0">能防住</h3>
+      <ul>
+        <li>伪造 Namespace、SA 或 Cluster 头冒充身份</li>
+        <li>拿 kube-apiserver token 或 legacy token 调用内部 API</li>
+        <li>拿业务 token 访问 kube-apiserver</li>
+        <li>利用 API Server 故障绕过认证（一律拒绝）</li>
+        <li>token 通过日志、响应或缓存泄露</li>
+        <li>client 误把 token 发到明文 HTTP、错误的 host 或经重定向发到别处</li>
+        <li>服务端被攻破后横向扩权（只有 TokenReview 权限）</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="margin-top:0">防不住 / 需要知道</h3>
+      <ul>
+        <li>token 被窃取后，在 1 小时有效期内可以被重放（未做 mTLS 绑定）</li>
+        <li>所有用 <code>internal-api</code> audience 的服务之间可以互相重放 token；需要隔离时请给每个服务配置独立的 audience</li>
+        <li>Pod 被攻破后，攻击者能读到 token（但只能以这个 SA 的身份调用这个 API）</li>
+        <li>节点被攻破后，该节点上所有 Pod 的 token 都能被读取</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note blue">
+    <b>关于 projected token 文件权限：</b>在 1.18 上 kubelet 把 token 文件写成 <code>0600 root</code>。我们<b>没有</b>给容器 root 权限，而是用 Pod 的 <code>fsGroup: 65532</code> 让 kubelet 把文件开放给这个组读取。容器进程仍是 <b>uid 65532、非 root</b>，同时 <code>allowPrivilegeEscalation: false</code>、<code>capabilities drop ALL</code>、根文件系统只读、基础镜像为 scratch（没有 shell）。fsGroup 只是一个普通的附加组 ID，不带来任何特权。
+  </div>
+</section>
+
+<section id="risk">
+  <h2>风险与后续</h2>
+  <table>
+    <tr><th style="width:220px">事项</th><th>说明 / 建议</th></tr>
+    <tr><td><span class="pill warn">撤销延迟 ≤ 30s</span></td><td>Pod 或 SA 删除后，已缓存的认证结果最多还能用一个 TTL。需要更快撤销时可以调小 <code>-cache-ttl</code>，代价是 TokenReview 次数增加。缓存不会延长 token 本身的有效期（不读取 JWT 中的 exp）。</td></tr>
+    <tr><td><span class="pill warn">apiserver 参数为手工修改</span></td><td>目前直接改了 master 上的 <code>/etc/kubernetes/apiserver</code>。master 重建、升级或 UK8s 下发配置时可能被覆盖。如果要推广，需要纳入 UK8s 的集群模板或升级流程，作为 1.18 集群的标准配置。</td></tr>
+    <tr><td><span class="pill info">API Server 依赖</span></td><td>API Server 不可用时，<b>新</b> token 无法认证（已缓存的在 TTL 内仍可用）。这是一律拒绝策略的有意取舍。</td></tr>
+    <tr><td><span class="pill info">多副本</span></td><td>缓存是进程内的，每个副本各自做 TokenReview；有 singleflight 和 30s TTL，API Server 压力 ≈ 副本数 × 活跃 token 数 / 30s。</td></tr>
+    <tr><td><span class="pill info">无效 token 不缓存</span></td><td>为了不把 API Server 的抖动固化成拒绝，失败结果不缓存；如果担心被无效 token 刷量，可以在前面加限流。</td></tr>
+    <tr><td><span class="pill info">与本地 JWKS 验签对比</span></td><td>本地验签不依赖 API Server、开销更低，但 1.18 的 OIDC discovery 还是 alpha，需要自己分发和轮换公钥，Pod 删除后也无法撤销。当前规模下 TokenReview 更简单、更安全。</td></tr>
+  </table>
+  <h3>回滚方式</h3>
+<pre># 在每台 master 上执行（逐台）
+cp -p /etc/kubernetes/apiserver.bak-20261021-tokenrequest /etc/kubernetes/apiserver &amp;&amp; systemctl restart kube-apiserver
+# 清理 demo
+kubectl delete ns production internal-api
+kubectl delete clusterrole,clusterrolebinding internal-api-tokenreview</pre>
+</section>
+
+<footer>源码、Kubernetes 清单、测试与 README：github.com/Andrewmatilde/k8s-sa-token-auth-demo（本页已隐去集群 ID 与内网地址）</footer>
+</main>
+
+<script>
+// Sequence diagram, rendered from a step list.
+(function () {
+  const lanes = [
+    { name: "kubelet", color: "#1f8a4c" },
+    { name: "Client Pod", color: "#2f6fd6" },
+    { name: "Middleware", color: "#2f6fd6" },
+    { name: "认证缓存", color: "#a86a00" },
+    { name: "kube-apiserver", color: "#6b4fc8" },
+    { name: "Authorizer / 业务", color: "#1f8a4c" },
+  ];
+  const X = [80, 250, 430, 600, 770, 925];
+  const msgs = [
+    [0, 4, "TokenRequest(aud=internal-api, 3600s)"],
+    [4, 0, "JWT（ca-key 签名，绑定 Pod/SA）", "ret"],
+    [0, 1, "写入 token 文件"],
+    [1, 1, "每次请求重新读取文件"],
+    [1, 2, "HTTPS（CA 校验）Authorization: Bearer"],
+    [2, 2, "校验格式 → SHA-256(token)"],
+    [2, 3, "查 key = hash + aud + cluster"],
+    [3, 2, "HIT 且未过期 → Identity（跳到授权）", "ret"],
+    [2, 4, "MISS：singleflight → TokenReview（3s 超时）"],
+    [4, 2, "authenticated / audiences / user", "ret"],
+    [2, 2, "校验 error、aud、SA 格式；失败 → 401/503"],
+    [2, 3, "仅成功结果写入，TTL 30s"],
+    [2, 5, "Identity{cluster(配置), ns, sa} + method + path"],
+    [5, 1, "200 / 201 · 不允许 → 403", "ret"],
+  ];
+  const top = 70, step = 40, h = top + msgs.length * step + 30;
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("seq");
+  svg.setAttribute("viewBox", `0 0 1000 ${h}`);
+  svg.setAttribute("font-family", "-apple-system, PingFang SC, Microsoft YaHei, sans-serif");
+  svg.setAttribute("font-size", "12.5");
+  const el = (t, a, txt) => { const e = document.createElementNS(NS, t); for (const k in a) e.setAttribute(k, a[k]); if (txt) e.textContent = txt; svg.appendChild(e); return e; };
+  const defs = el("defs", {});
+  lanes.forEach((l, i) => {
+    const m = document.createElementNS(NS, "marker");
+    Object.entries({ id: "m" + i, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }).forEach(([k, v]) => m.setAttribute(k, v));
+    const p = document.createElementNS(NS, "path"); p.setAttribute("d", "M0,0 L10,5 L0,10 z"); p.setAttribute("fill", l.color);
+    m.appendChild(p); defs.appendChild(m);
+  });
+  lanes.forEach((l, i) => {
+    el("rect", { x: X[i] - 70, y: 14, width: 140, height: 34, rx: 8, fill: "#fff", stroke: l.color, "stroke-width": 1.5 });
+    el("text", { x: X[i], y: 36, "text-anchor": "middle", "font-weight": 700, fill: l.color }, l.name);
+    el("line", { x1: X[i], y1: 48, x2: X[i], y2: h - 10, stroke: "#c5ccd8", "stroke-dasharray": "4 4" });
+  });
+  // shade the cache-hit fast path
+  el("rect", { x: 330, y: top + 6 * step - 22, width: 380, height: step * 2 - 4, rx: 6, fill: "#fdf3e1", opacity: 0.7 });
+  el("rect", { x: 330, y: top + 8 * step - 22, width: 520, height: step * 4 - 4, rx: 6, fill: "#f0ecfb", opacity: 0.55 });
+  el("text", { x: 990, y: top + 6 * step - 6, "text-anchor": "end", fill: "#a86a00", "font-weight": 700 }, "热路径");
+  el("text", { x: 990, y: top + 8 * step - 6, "text-anchor": "end", fill: "#6b4fc8", "font-weight": 700 }, "仅 MISS 时");
+  msgs.forEach(([f, t, label, kind], i) => {
+    const y = top + i * step;
+    const color = lanes[f].color;
+    el("circle", { cx: 18, cy: y - 4, r: 10, fill: color });
+    el("text", { x: 18, y: y, "text-anchor": "middle", fill: "#fff", "font-size": 11, "font-weight": 700 }, String(i + 1));
+    if (f === t) {
+      el("path", { d: `M${X[f]} ${y - 10} h28 v14 h-26`, fill: "none", stroke: color, "stroke-width": 1.8, "marker-end": `url(#m${f})` });
+      el("text", { x: X[f] + 36, y: y, fill: "#1d2433" }, label);
+    } else {
+      const dir = t > f ? 1 : -1;
+      el("line", { x1: X[f], y1: y, x2: X[t] - dir * 4, y2: y, stroke: color, "stroke-width": 1.8, "stroke-dasharray": kind === "ret" ? "6 4" : "", "marker-end": `url(#m${f})` });
+      const mid = (X[f] + X[t]) / 2;
+      const tx = el("text", { x: mid, y: y - 7, "text-anchor": "middle", fill: "#1d2433" }, label);
+      tx.setAttribute("paint-order", "stroke"); tx.setAttribute("stroke", "#fff"); tx.setAttribute("stroke-width", "4");
+    }
+  });
+})();
+</script>
+</body>
+</html>

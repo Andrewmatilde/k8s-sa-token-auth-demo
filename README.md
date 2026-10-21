@@ -2,6 +2,8 @@
 
 Pod 用 Projected ServiceAccount Token（audience=`internal-api`）作为 Bearer Token 调用内部 HTTPS API；服务端用 TokenReview 验证，结果按 `SHA-256(token)+audience+cluster` 做 30s 本地缓存，singleflight 合并并发 miss，认证后按 Namespace/ServiceAccount 做默认拒绝的授权。
 
+图文说明（拓扑、安全链路时序图、1.18 实测结果）：[docs/overview.html](docs/overview.html)，在线预览：<https://htmlpreview.github.io/?https://github.com/Andrewmatilde/k8s-sa-token-auth-demo/blob/main/docs/overview.html>
+
 依赖：标准库 + `k8s.io/client-go v0.18.19`（对应 1.18 集群，兼容 1.17 的 TokenReview v1 API）+ `golang.org/x/sync/singleflight`。
 
 ## 设计与认证流程
